@@ -26,7 +26,7 @@ if USE_FLEX_ATTENTION:
     from functools import partial
     from torch.nn.attention.flex_attention import flex_attention, create_block_mask
     _flex_attention_compiled = torch.compile(
-        partial(flex_attention, kernel_options={"BACKEND": "FLASH"}),
+        flex_attention,
         dynamic=False,
     )
     print("Using FlexAttention with FA4 backend (Blackwell)")
