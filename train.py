@@ -21,6 +21,7 @@ inductor_config.coordinate_descent_tuning = True
 inductor_config.epilogue_fusion = True
 inductor_config.aggressive_fusion = True
 inductor_config.shape_padding = True
+inductor_config.max_autotune_pointwise = True
 import torch.nn as nn
 import torch.nn.functional as F
 
