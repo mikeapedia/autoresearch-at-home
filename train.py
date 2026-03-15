@@ -34,29 +34,25 @@ if USE_FA4_DIRECT:
     from flash_attn.cute import flash_attn_func as _fa4_raw
 
     # Register FA4 as a custom op so torch.compile treats it as opaque
-    # Forward returns (out, lse) but custom_op only supports single tensor return
-    # Use two custom ops: one for forward output, one stashed lse via global
-    _fa4_lse_cache = {}
-
     @torch.library.custom_op("autoresearch::fa4_causal", mutates_args=())
     def _fa4_causal_op(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-                       window_left: int) -> torch.Tensor:
+                       window_left: int) -> tuple[torch.Tensor, torch.Tensor]:
         ws = (window_left, 0) if window_left > 0 else (None, None)
         out, lse = _fa4_raw(q, k, v, causal=True, window_size=ws, return_lse=True)
-        _fa4_lse_cache['lse'] = lse
-        return out
+        return out, lse
 
     @_fa4_causal_op.register_fake
     def _fa4_causal_fake(q, k, v, window_left):
-        return torch.empty_like(q)
+        B, T, H, D = q.shape
+        return torch.empty_like(q), torch.empty(B, H, T, device=q.device, dtype=torch.float32)
 
     def _fa4_setup_context(ctx, inputs, output):
         q, k, v, window_left = inputs
-        lse = _fa4_lse_cache.get('lse')
-        ctx.save_for_backward(q, k, v, output, lse)
+        out, lse = output
+        ctx.save_for_backward(q, k, v, out, lse)
         ctx.window_left = window_left
 
-    def _fa4_backward(ctx, grad_output):
+    def _fa4_backward(ctx, grad_output, grad_lse):
         q, k, v, out, lse = ctx.saved_tensors
         wl = ctx.window_left if ctx.window_left > 0 else None
         from flash_attn.cute.interface import _flash_attn_bwd
@@ -72,7 +68,8 @@ if USE_FA4_DIRECT:
 
     def fa4_attn(q, k, v, causal=True, window_size=None):
         ws = window_size if window_size is not None and window_size > 0 else -1
-        return torch.ops.autoresearch.fa4_causal(q, k, v, ws)
+        out, _lse = torch.ops.autoresearch.fa4_causal(q, k, v, ws)
+        return out
 
     print("Using FA4 as custom op (Blackwell)")
 else:
