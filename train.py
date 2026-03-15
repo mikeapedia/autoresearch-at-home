@@ -31,38 +31,46 @@ cap = torch.cuda.get_device_capability()
 USE_FA4_DIRECT = cap[0] >= 10  # Blackwell: use FA4 directly with allow_in_graph
 
 if USE_FA4_DIRECT:
-    # Monkey-patch flash_attn to handle torch.compile stream proxies
-    import flash_attn.cute.interface as _fa4_iface
-    _fa4_orig_fwd = _fa4_iface._flash_attn_fwd
-    _fa4_orig_bwd = _fa4_iface._flash_attn_bwd
-
-    def _patched_get_stream():
-        """Get CUDA stream handle, works inside and outside torch.compile."""
-        stream = torch.cuda.current_stream()
-        if hasattr(stream, 'cuda_stream'):
-            return stream.cuda_stream
-        return 0  # default stream
-
-    # Patch the module to use our stream getter
-    import cuda.bindings.driver as cuda
-    _orig_code_fwd = _fa4_iface._flash_attn_fwd.__code__
-    # Can't easily patch the function body, so use compiler.disable instead
-    # but ONLY on the FA4 internal functions, not the whole model
-
     from flash_attn.cute import flash_attn_func as _fa4_raw
-    from flash_attn.cute.interface import FlashAttnFunc as _FA4Func
 
-    # Tell dynamo to treat FA4's apply as an opaque node
-    torch._dynamo.allow_in_graph(_FA4Func)
-
-    def fa4_attn(q, k, v, causal=True, window_size=None):
-        ws = (window_size, 0) if window_size is not None else (None, None)
-        out, _lse = _FA4Func.apply(q, k, v, None, causal, ws,
-                                    None, 0.0, 1, None, False,
-                                    None, None, None, None, None, None, False)
+    # Register FA4 as a custom op so torch.compile treats it as opaque
+    @torch.library.custom_op("autoresearch::fa4_causal", mutates_args=())
+    def _fa4_causal_op(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                       window_left: int) -> torch.Tensor:
+        ws = (window_left, 0) if window_left > 0 else (None, None)
+        out, _lse = _fa4_raw(q, k, v, causal=True, window_size=ws)
         return out
 
-    print("Using FA4 direct API with allow_in_graph (Blackwell)")
+    @_fa4_causal_op.register_fake
+    def _fa4_causal_fake(q, k, v, window_left):
+        return torch.empty_like(q)
+
+    # Register backward via setup_context + backward
+    def _fa4_setup_context(ctx, inputs, output):
+        q, k, v, window_left = inputs
+        ctx.save_for_backward(q, k, v, output)
+        ctx.window_left = window_left
+
+    def _fa4_backward(ctx, grad_output):
+        q, k, v, out = ctx.saved_tensors
+        ws = (ctx.window_left, 0) if ctx.window_left > 0 else (None, None)
+        from flash_attn.cute.interface import _flash_attn_bwd
+        dq, dk, dv = _flash_attn_bwd(
+            grad_output, q, k, v, out,
+            softmax_lse=None,  # we didn't save lse
+            causal=True,
+            window_size_left=ws[0],
+            window_size_right=0,
+        )
+        return dq, dk, dv, None
+
+    _fa4_causal_op.register_autograd(_fa4_backward, setup_context=_fa4_setup_context)
+
+    def fa4_attn(q, k, v, causal=True, window_size=None):
+        ws = window_size if window_size is not None and window_size > 0 else -1
+        return torch.ops.autoresearch.fa4_causal(q, k, v, ws)
+
+    print("Using FA4 as custom op (Blackwell)")
 else:
     # varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
     repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
