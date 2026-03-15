@@ -187,7 +187,7 @@ class GPT(nn.Module):
             for i in range(config.n_layer) if has_ve(i, config.n_layer)
         })
         # Pre-built VE list for fast lookup (avoids dict access in compiled forward)
-        self._ve_list = [self.value_embeds.get(str(i)) for i in range(config.n_layer)]
+        self._ve_list = [self.value_embeds[str(i)] if str(i) in self.value_embeds else None for i in range(config.n_layer)]
         # Rotary embeddings
         self.rotary_seq_len = config.sequence_len * 10
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
