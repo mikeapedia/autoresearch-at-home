@@ -34,32 +34,36 @@ if USE_FA4_DIRECT:
     from flash_attn.cute import flash_attn_func as _fa4_raw
 
     # Register FA4 as a custom op so torch.compile treats it as opaque
+    # Forward returns (out, lse) but custom_op only supports single tensor return
+    # Use two custom ops: one for forward output, one stashed lse via global
+    _fa4_lse_cache = {}
+
     @torch.library.custom_op("autoresearch::fa4_causal", mutates_args=())
     def _fa4_causal_op(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                        window_left: int) -> torch.Tensor:
         ws = (window_left, 0) if window_left > 0 else (None, None)
-        out, _lse = _fa4_raw(q, k, v, causal=True, window_size=ws)
+        out, lse = _fa4_raw(q, k, v, causal=True, window_size=ws, return_lse=True)
+        _fa4_lse_cache['lse'] = lse
         return out
 
     @_fa4_causal_op.register_fake
     def _fa4_causal_fake(q, k, v, window_left):
         return torch.empty_like(q)
 
-    # Register backward via setup_context + backward
     def _fa4_setup_context(ctx, inputs, output):
         q, k, v, window_left = inputs
-        ctx.save_for_backward(q, k, v, output)
+        lse = _fa4_lse_cache.get('lse')
+        ctx.save_for_backward(q, k, v, output, lse)
         ctx.window_left = window_left
 
     def _fa4_backward(ctx, grad_output):
-        q, k, v, out = ctx.saved_tensors
-        ws = (ctx.window_left, 0) if ctx.window_left > 0 else (None, None)
+        q, k, v, out, lse = ctx.saved_tensors
+        wl = ctx.window_left if ctx.window_left > 0 else None
         from flash_attn.cute.interface import _flash_attn_bwd
         dq, dk, dv = _flash_attn_bwd(
-            grad_output, q, k, v, out,
-            softmax_lse=None,  # we didn't save lse
+            q, k, v, out, grad_output, lse,
             causal=True,
-            window_size_left=ws[0],
+            window_size_left=wl,
             window_size_right=0,
         )
         return dq, dk, dv, None
