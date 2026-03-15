@@ -186,6 +186,8 @@ class GPT(nn.Module):
             str(i): nn.Embedding(config.vocab_size, kv_dim)
             for i in range(config.n_layer) if has_ve(i, config.n_layer)
         })
+        # Pre-built VE list for fast lookup (avoids dict access in compiled forward)
+        self._ve_list = [self.value_embeds.get(str(i)) for i in range(config.n_layer)]
         # Rotary embeddings
         self.rotary_seq_len = config.sequence_len * 10
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
@@ -319,12 +321,6 @@ class GPT(nn.Module):
         assert T <= self.cos.size(1)
         cos_sin = self.cos[:, :T], self.sin[:, :T]
 
-        # Build block masks once on first forward pass (model starts on meta device)
-        if USE_FLEX_ATTENTION and self._flex_block_masks is None:
-            unique_windows = set(self.window_sizes)
-            cache = {ws: _build_flex_block_mask(ws, B, self.config.n_head, T) for ws in unique_windows}
-            self._flex_block_masks = [cache[ws] for ws in self.window_sizes]
-
         x = self.transformer.wte(idx)
         x = norm(x)
         x0 = x
@@ -336,7 +332,7 @@ class GPT(nn.Module):
                 x = x + self.skip2_lambdas[i] * x_prev2
             x_prev2 = x_prev1
             x_prev1 = x
-            ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
+            ve = self._ve_list[i](idx) if self._ve_list[i] is not None else None
             block_mask = self._flex_block_masks[i] if USE_FLEX_ATTENTION else None
             x = block(x, ve, cos_sin, self.window_sizes[i], block_mask)
         x = norm(x)
@@ -607,6 +603,12 @@ with torch.device("meta"):
 model.to_empty(device=device)
 model.init_weights()
 
+# Pre-build FlexAttention block masks (before compile, avoids lazy init in forward)
+if USE_FLEX_ATTENTION:
+    unique_windows = set(model.window_sizes)
+    cache = {ws: _build_flex_block_mask(ws, DEVICE_BATCH_SIZE, model.config.n_head, MAX_SEQ_LEN) for ws in unique_windows}
+    model._flex_block_masks = [cache[ws] for ws in model.window_sizes]
+
 param_counts = model.num_scaling_params()
 print("Parameter counts:")
 for key, value in param_counts.items():
@@ -628,7 +630,7 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
-model = torch.compile(model, dynamic=False, mode="max-autotune-no-cudagraphs")
+model = torch.compile(model, dynamic=False, mode="max-autotune-no-cudagraphs", fullgraph=True)
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
 x, y, epoch = next(train_loader)  # prefetch first batch
