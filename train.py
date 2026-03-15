@@ -154,8 +154,8 @@ class CausalSelfAttention(nn.Module):
         cos, sin = cos_sin
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
-        q = q * 1.20
-        k = k * 1.20
+        q = q * 1.15
+        k = k * 1.15
 
         if USE_FA4_DIRECT:
             # FA4 takes (B, T, H, D) directly — no transpose needed
