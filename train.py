@@ -20,6 +20,7 @@ import torch._inductor.config as inductor_config
 inductor_config.coordinate_descent_tuning = True
 inductor_config.epilogue_fusion = True
 inductor_config.aggressive_fusion = True
+inductor_config.shape_padding = True
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -665,10 +666,12 @@ t_start_training = time.time()
 smooth_train_loss = 0
 total_training_time = 0
 step = 0
+start_event = torch.cuda.Event(enable_timing=True)
+end_event = torch.cuda.Event(enable_timing=True)
 
 while True:
-    torch.cuda.synchronize()
-    t0 = time.time()
+    torch.compiler.cudagraph_mark_step_begin()
+    start_event.record()
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
             loss = model(x, y)
@@ -700,9 +703,9 @@ while True:
         print("FAIL")
         exit(1)
 
-    torch.cuda.synchronize()
-    t1 = time.time()
-    dt = t1 - t0
+    end_event.record()
+    end_event.synchronize()
+    dt = start_event.elapsed_time(end_event) / 1000
 
     if step > TIMING_WARMUP_STEPS:
         total_training_time += dt
