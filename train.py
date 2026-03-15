@@ -52,16 +52,26 @@ if USE_FA4_DIRECT:
         ctx.save_for_backward(q, k, v, out, lse)
         ctx.window_left = window_left
 
+    from flash_attn.cute.interface import _flash_attn_bwd as _fa4_bwd_raw
+
+    @torch.library.custom_op("autoresearch::fa4_bwd", mutates_args=())
+    def _fa4_bwd_op(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                    out: torch.Tensor, grad_output: torch.Tensor, lse: torch.Tensor,
+                    window_left: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        wl = window_left if window_left > 0 else None
+        dq, dk, dv = _fa4_bwd_raw(
+            q, k, v, out, grad_output, lse,
+            causal=True, window_size_left=wl, window_size_right=0,
+        )
+        return dq, dk, dv
+
+    @_fa4_bwd_op.register_fake
+    def _fa4_bwd_fake(q, k, v, out, grad_output, lse, window_left):
+        return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+
     def _fa4_backward(ctx, grad_output, grad_lse):
         q, k, v, out, lse = ctx.saved_tensors
-        wl = ctx.window_left if ctx.window_left > 0 else None
-        from flash_attn.cute.interface import _flash_attn_bwd
-        dq, dk, dv = _flash_attn_bwd(
-            q, k, v, out, grad_output, lse,
-            causal=True,
-            window_size_left=wl,
-            window_size_right=0,
-        )
+        dq, dk, dv = torch.ops.autoresearch.fa4_bwd(q, k, v, out, grad_output, lse, ctx.window_left)
         return dq, dk, dv, None
 
     _fa4_causal_op.register_autograd(_fa4_backward, setup_context=_fa4_setup_context)
