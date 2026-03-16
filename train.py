@@ -528,8 +528,8 @@ SCALAR_LR = 1.0         # learning rate for per-layer scalars (Adam)
 WEIGHT_DECAY = 0.1525   # cautious weight decay for Muon
 ADAM_BETAS = (0.8, 0.99) # Adam beta1, beta2
 WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
-WARMDOWN_RATIO = 1.0    # fraction of time budget for LR warmdown
-FINAL_LR_FRAC = 0.005   # final LR as fraction of initial
+WARMDOWN_RATIO = 0.3    # fraction of time budget for LR warmdown (WSD: 70% stable + 30% decay)
+FINAL_LR_FRAC = 0.05    # final LR as fraction of initial (WSD standard: 5%)
 
 # Model size
 DEPTH = 12              # number of transformer layers
@@ -667,8 +667,10 @@ def get_lr_multiplier(progress):
     elif progress < 1.0 - WARMDOWN_RATIO:
         return 1.0
     else:
-        cooldown = (1.0 - progress) / WARMDOWN_RATIO
-        return cooldown * 1.0 + (1 - cooldown) * FINAL_LR_FRAC
+        # Sqrt decay: 1 - sqrt(t) shape (OLMo 2, Phi-4 style)
+        decay_progress = (progress - (1.0 - WARMDOWN_RATIO)) / WARMDOWN_RATIO  # 0→1
+        sqrt_decay = 1.0 - decay_progress ** 0.5  # starts fast, slows down
+        return sqrt_decay * (1.0 - FINAL_LR_FRAC) + FINAL_LR_FRAC
 
 def get_muon_momentum(step):
     frac = min(step / 300, 1)
