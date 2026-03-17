@@ -25,6 +25,8 @@ inductor_config.max_autotune_pointwise = True
 import torch.nn as nn
 import torch.nn.functional as F
 
+from quack import rmsnorm as quack_rmsnorm
+from quack.mlp import mlp_func
 from kernels import get_kernel
 cap = torch.cuda.get_device_capability()
 
@@ -106,7 +108,7 @@ class GPTConfig:
 
 
 def norm(x):
-    return F.rms_norm(x, (x.size(-1),))
+    return quack_rmsnorm(x)
 
 
 def has_ve(layer_idx, n_layer):
@@ -176,10 +178,7 @@ class MLP(nn.Module):
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = F.relu(x).square()
-        x = self.c_proj(x)
-        return x
+        return mlp_func(x, self.c_fc.weight, self.c_proj.weight, activation="relu_sq")
 
 
 class Block(nn.Module):
