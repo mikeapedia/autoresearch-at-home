@@ -90,6 +90,126 @@ else:
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
+# QuACK kernels (CuTe-DSL, Blackwell/Hopper only, Linux only)
+USE_QUACK = False
+try:
+    from quack import rmsnorm as _quack_rmsnorm_raw
+    from quack import gemm_act as _quack_gemm_act_raw
+    USE_QUACK = cap[0] >= 9  # SM90+ (Hopper/Blackwell)
+    if USE_QUACK:
+        print("Using QuACK kernels (CuTe-DSL)")
+except ImportError:
+    pass  # Not on Linux or quack-kernels not installed
+
+if USE_QUACK:
+    # --- QuACK RMSNorm custom op (follows FA4 registration pattern) ---
+    _quack_norm_weights = {}  # (dim, dtype) -> ones tensor, lazily populated
+
+    @torch.library.custom_op("autoresearch::quack_rmsnorm", mutates_args=())
+    def _quack_rmsnorm_op(x: torch.Tensor, dim: int) -> torch.Tensor:
+        orig_shape = x.shape
+        x_2d = x.view(-1, dim)
+        cache_key = (dim, x.dtype)
+        if cache_key not in _quack_norm_weights:
+            _quack_norm_weights[cache_key] = torch.ones(dim, dtype=x.dtype, device=x.device)
+        w = _quack_norm_weights[cache_key]
+        out = _quack_rmsnorm_raw(x_2d, w)
+        return out.view(orig_shape)
+
+    @_quack_rmsnorm_op.register_fake
+    def _quack_rmsnorm_fake(x, dim):
+        return torch.empty_like(x)
+
+    def _quack_rmsnorm_setup_ctx(ctx, inputs, output):
+        x, dim = inputs
+        ctx.save_for_backward(x, output)
+        ctx.dim = dim
+
+    @torch.library.custom_op("autoresearch::quack_rmsnorm_bwd", mutates_args=())
+    def _quack_rmsnorm_bwd_op(
+        grad_output: torch.Tensor, x: torch.Tensor, y: torch.Tensor, dim: int
+    ) -> torch.Tensor:
+        # RMSNorm backward: dx = (1/rms) * (dy - y * mean(dy * y))
+        rms_sq = x.float().square().mean(dim=-1, keepdim=True)
+        rms_inv = (rms_sq + 1e-6).rsqrt()
+        dy = grad_output.float()
+        y_f = y.float()
+        dx = rms_inv * (dy - y_f * (dy * y_f).mean(dim=-1, keepdim=True))
+        return dx.to(x.dtype)
+
+    @_quack_rmsnorm_bwd_op.register_fake
+    def _quack_rmsnorm_bwd_fake(grad_output, x, y, dim):
+        return torch.empty_like(x)
+
+    def _quack_rmsnorm_backward(ctx, grad_output):
+        x, y = ctx.saved_tensors
+        dx = torch.ops.autoresearch.quack_rmsnorm_bwd(grad_output, x, y, ctx.dim)
+        return dx, None  # None for dim (non-differentiable)
+
+    _quack_rmsnorm_op.register_autograd(
+        _quack_rmsnorm_backward, setup_context=_quack_rmsnorm_setup_ctx
+    )
+
+    # --- QuACK fused GEMM + relu² custom op ---
+    @torch.library.custom_op("autoresearch::fused_fc_relu_sq", mutates_args=())
+    def _fused_fc_relu_sq_op(
+        x: torch.Tensor, weight: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # gemm_act expects 2D: (M, K) @ (K, N) with relu² epilogue
+        # weight is nn.Linear shape (out, in), need .T for (in, out)
+        orig_shape = x.shape
+        x_2d = x.reshape(-1, x.shape[-1])
+        preact, postact = _quack_gemm_act_raw(
+            x_2d, weight.T.contiguous(), activation="relu_sq", store_preact=True
+        )
+        out_shape = (*orig_shape[:-1], weight.shape[0])
+        return preact.view(out_shape), postact.view(out_shape)
+
+    @_fused_fc_relu_sq_op.register_fake
+    def _fused_fc_relu_sq_fake(x, weight):
+        out_features = weight.shape[0]
+        out_shape = (*x.shape[:-1], out_features)
+        return (torch.empty(out_shape, dtype=x.dtype, device=x.device),
+                torch.empty(out_shape, dtype=x.dtype, device=x.device))
+
+    def _fused_fc_setup_ctx(ctx, inputs, output):
+        x, weight = inputs
+        preact, _postact = output
+        ctx.save_for_backward(x, weight, preact)
+
+    @torch.library.custom_op("autoresearch::fused_fc_relu_sq_bwd", mutates_args=())
+    def _fused_fc_relu_sq_bwd_op(
+        grad_output: torch.Tensor, x: torch.Tensor,
+        weight: torch.Tensor, preact: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # relu_sq backward: d/dx[relu(x)²] = 2*relu(x)  (0 for x<=0)
+        dpreact = grad_output * (2.0 * F.relu(preact))
+        # Input gradient: dpreact @ weight  (...,out) @ (out,in) → (...,in)
+        dx = dpreact @ weight
+        # Weight gradient: flatten to 2D first (x may be 3D: B,T,C)
+        x_2d = x.reshape(-1, x.shape[-1])               # (B*T, in)
+        dpreact_2d = dpreact.reshape(-1, dpreact.shape[-1])  # (B*T, out)
+        dw = (x_2d.T @ dpreact_2d).T                    # (out, in) matches weight shape
+        return dx, dw
+
+    @_fused_fc_relu_sq_bwd_op.register_fake
+    def _fused_fc_relu_sq_bwd_fake(grad_output, x, weight, preact):
+        return torch.empty_like(x), torch.empty_like(weight)
+
+    def _fused_fc_backward(ctx, grad_preact, grad_postact):
+        x, weight, preact = ctx.saved_tensors
+        # grad_postact is the gradient that flows from c_proj backward
+        dx, dw = torch.ops.autoresearch.fused_fc_relu_sq_bwd(
+            grad_postact, x, weight, preact
+        )
+        return dx, dw
+
+    _fused_fc_relu_sq_op.register_autograd(
+        _fused_fc_backward, setup_context=_fused_fc_setup_ctx
+    )
+
+    print("QuACK custom ops registered")
+
 # ---------------------------------------------------------------------------
 # GPT Model
 # ---------------------------------------------------------------------------
@@ -106,6 +226,8 @@ class GPTConfig:
 
 
 def norm(x):
+    if USE_QUACK:
+        return torch.ops.autoresearch.quack_rmsnorm(x, x.size(-1))
     return F.rms_norm(x, (x.size(-1),))
 
 
@@ -176,8 +298,11 @@ class MLP(nn.Module):
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = F.relu(x).square()
+        if USE_QUACK:
+            _preact, x = torch.ops.autoresearch.fused_fc_relu_sq(x, self.c_fc.weight)
+        else:
+            x = self.c_fc(x)
+            x = F.relu(x).square()
         x = self.c_proj(x)
         return x
 
@@ -650,6 +775,17 @@ optimizer = model.setup_optimizer(
     matrix_lr=MATRIX_LR,
     weight_decay=WEIGHT_DECAY,
 )
+
+# Warm up QuACK kernels before torch.compile to avoid JIT overhead in training
+if USE_QUACK:
+    with torch.no_grad():
+        _warmup_x = torch.randn(128, config.n_embd, dtype=torch.bfloat16, device=device)
+        _ = torch.ops.autoresearch.quack_rmsnorm(_warmup_x, config.n_embd)
+        _warmup_w = torch.randn(4 * config.n_embd, config.n_embd, dtype=torch.bfloat16, device=device)
+        _ = torch.ops.autoresearch.fused_fc_relu_sq(_warmup_x, _warmup_w)
+        del _warmup_x, _warmup_w
+        torch.cuda.empty_cache()
+    print("QuACK kernels warmed up")
 
 model = torch.compile(model, dynamic=False, mode="max-autotune", fullgraph=True)
 
